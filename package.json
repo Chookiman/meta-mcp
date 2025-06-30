@@ -1,0 +1,25 @@
+{
+  "name": "facebook-media-agent",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "verify-setup.js",
+  "scripts": {
+    "test": "node src/test-facebook.js",
+    "mcp": "node src/facebook-mcp-server.js",
+    "verify": "node verify-setup.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.13.2",
+    "axios": "^1.6.0",
+    "dotenv": "^16.0.0",
+    "express": "^5.1.0",
+    "facebook-nodejs-business-sdk": "^13.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
+  }
+}

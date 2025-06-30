@@ -1,0 +1,4 @@
+# from the repo root
+cd /Users/grug/Downloads/facebook-media-agent
+nano test-http.js          # or use VS Code / any editor
+
