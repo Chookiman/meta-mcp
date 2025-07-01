@@ -1093,6 +1093,619 @@ server.registerTool(
     }
 );
 
+server.registerTool(
+    'analyze_creative_performance',
+    {
+        title: 'Analyze Creative Performance',
+        description: 'Deep analysis of creative elements and their performance correlation',
+        inputSchema: z.object({
+            lookbackDays: z.number().default(7),
+            minImpressions: z.number().default(1000)
+        })
+    },
+    async ({ lookbackDays, minImpressions }) => {
+        await loadState();
+        try {
+            const account = new AdAccount(accountId);
+            
+            // Get all ads with creative info
+            const ads = await account.getAds(
+                ['name', 'creative', 'adset_id'],
+                { 
+                    filtering: [{ field: 'status', operator: 'IN', value: ['ACTIVE', 'PAUSED'] }],
+                    limit: 500
+                }
+            );
+            
+            const creativeAnalysis = [];
+            
+            for (const ad of ads) {
+                try {
+                    // Get ad insights
+                    const insights = await ad.getInsights(
+                        ['impressions', 'clicks', 'spend', 'ctr', 'cpm', 'video_avg_time_watched_actions', 'video_p25_watched_actions', 'video_p50_watched_actions', 'video_p75_watched_actions', 'video_p100_watched_actions', 'purchase_roas'],
+                        { date_preset: `last_${lookbackDays}_d` }
+                    );
+                    
+                    const metrics = insights[0] || {};
+                    if (parseInt(metrics.impressions || 0) < minImpressions) continue;
+                    
+                    // Get creative details
+                    const creative = await ad.getCreative(['title', 'body', 'image_url', 'video_id', 'thumbnail_url']);
+                    
+                    // Extract hook (first 3 seconds/first line of text)
+                    const hook = creative.body ? creative.body.split('\n')[0].substring(0, 100) : 'No text';
+                    
+                    // Calculate video retention if available
+                    const videoMetrics = {};
+                    if (metrics.video_p25_watched_actions) {
+                        const p25 = parseInt(metrics.video_p25_watched_actions[0]?.value || 0);
+                        const p50 = parseInt(metrics.video_p50_watched_actions[0]?.value || 0);
+                        const p75 = parseInt(metrics.video_p75_watched_actions[0]?.value || 0);
+                        const p100 = parseInt(metrics.video_p100_watched_actions[0]?.value || 0);
+                        
+                        videoMetrics.retention = {
+                            p25: p25,
+                            p50: p50,
+                            p75: p75,
+                            p100: p100,
+                            dropoffRate: p25 > 0 ? ((p25 - p100) / p25 * 100).toFixed(1) + '%' : 'N/A'
+                        };
+                    }
+                    
+                    creativeAnalysis.push({
+                        adId: ad.id,
+                        adName: ad.name,
+                        creative: {
+                            id: creative.id,
+                            type: creative.video_id ? 'VIDEO' : 'IMAGE',
+                            headline: creative.title || 'N/A',
+                            hook: hook,
+                            hasVideo: !!creative.video_id
+                        },
+                        performance: {
+                            impressions: metrics.impressions,
+                            ctr: parseFloat(metrics.ctr || 0),
+                            cpm: parseFloat(metrics.cpm || 0),
+                            spend: parseFloat(metrics.spend || 0),
+                            roas: metrics.purchase_roas ? parseFloat(metrics.purchase_roas[0]?.value || 0) : null
+                        },
+                        videoMetrics: videoMetrics
+                    });
+                    
+                } catch (error) {
+                    console.error(`Error analyzing ad ${ad.id}:`, error);
+                }
+            }
+            
+            // Sort by CTR to find patterns
+            creativeAnalysis.sort((a, b) => b.performance.ctr - a.performance.ctr);
+            
+            // Analyze patterns
+            const topPerformers = creativeAnalysis.slice(0, 10);
+            const bottomPerformers = creativeAnalysis.slice(-10);
+            
+            // Extract common elements in top performers
+            const patterns = {
+                hooks: {},
+                types: { VIDEO: 0, IMAGE: 0 },
+                avgRetentionTop: { p25: 0, p50: 0, p75: 0, p100: 0 },
+                avgRetentionBottom: { p25: 0, p50: 0, p75: 0, p100: 0 }
+            };
+            
+            // Analyze top performers
+            topPerformers.forEach(ad => {
+                patterns.types[ad.creative.type]++;
+                
+                // Extract hook patterns (first few words)
+                const hookWords = ad.creative.hook.split(' ').slice(0, 3).join(' ').toLowerCase();
+                patterns.hooks[hookWords] = (patterns.hooks[hookWords] || 0) + 1;
+                
+                // Video retention
+                if (ad.videoMetrics.retention) {
+                    patterns.avgRetentionTop.p25 += ad.videoMetrics.retention.p25;
+                    patterns.avgRetentionTop.p50 += ad.videoMetrics.retention.p50;
+                    patterns.avgRetentionTop.p75 += ad.videoMetrics.retention.p75;
+                    patterns.avgRetentionTop.p100 += ad.videoMetrics.retention.p100;
+                }
+            });
+            
+            // Calculate averages
+            const videoCount = topPerformers.filter(ad => ad.videoMetrics.retention).length;
+            if (videoCount > 0) {
+                Object.keys(patterns.avgRetentionTop).forEach(key => {
+                    patterns.avgRetentionTop[key] = Math.round(patterns.avgRetentionTop[key] / videoCount);
+                });
+            }
+            
+            const response = {
+                totalAdsAnalyzed: creativeAnalysis.length,
+                lookbackPeriod: `${lookbackDays} days`,
+                topPerformers: topPerformers.map(ad => ({
+                    adName: ad.adName,
+                    type: ad.creative.type,
+                    hook: ad.creative.hook,
+                    ctr: `${ad.performance.ctr.toFixed(2)}%`,
+                    spend: `$${ad.performance.spend.toFixed(2)}`,
+                    roas: ad.performance.roas ? `${ad.performance.roas.toFixed(2)}x` : 'N/A',
+                    videoRetention: ad.videoMetrics.retention || null
+                })),
+                bottomPerformers: bottomPerformers.map(ad => ({
+                    adName: ad.adName,
+                    type: ad.creative.type,
+                    hook: ad.creative.hook,
+                    ctr: `${ad.performance.ctr.toFixed(2)}%`,
+                    spend: `$${ad.performance.spend.toFixed(2)}`
+                })),
+                insights: {
+                    bestPerformingType: patterns.types.VIDEO > patterns.types.IMAGE ? 'VIDEO' : 'IMAGE',
+                    commonHookPatterns: Object.entries(patterns.hooks)
+                        .sort((a, b) => b[1] - a[1])
+                        .slice(0, 5)
+                        .map(([hook, count]) => ({ hook, count })),
+                    videoRetentionInsight: videoCount > 0 ? {
+                        topPerformersAvg: patterns.avgRetentionTop,
+                        recommendation: patterns.avgRetentionTop.p50 < patterns.avgRetentionTop.p25 * 0.5 
+                            ? 'Hook is strong but content loses viewers. Focus on first 5 seconds.'
+                            : 'Good retention throughout. Scale these video styles.'
+                    } : null
+                },
+                recommendations: [
+                    `Top performing CTR: ${topPerformers[0]?.performance.ctr.toFixed(2)}% - Replicate this creative style`,
+                    patterns.types.VIDEO > patterns.types.IMAGE 
+                        ? 'Video ads performing better - prioritize video content'
+                        : 'Image ads performing better - test more static creatives',
+                    `Test variations of these winning hooks: ${Object.keys(patterns.hooks).slice(0, 3).join(', ')}`
+                ]
+            };
+            
+            // Add notification for significant findings
+            if (topPerformers[0]?.performance.ctr > 3) {
+                response.notification = {
+                    priority: NOTIFICATION_PRIORITY.SUCCESS,
+                    message: `🎯 Found high-performing creative pattern: ${topPerformers[0].creative.hook.substring(0, 50)}... achieving ${topPerformers[0].performance.ctr.toFixed(2)}% CTR`
+                };
+            }
+            
+            return {
+                content: [{
+                    type: 'text',
+                    text: JSON.stringify(response, null, 2)
+                }]
+            };
+            
+        } catch (error) {
+            return {
+                content: [{
+                    type: 'text',
+                    text: JSON.stringify({ 
+                        error: error.message,
+                        tool: 'analyze_creative_performance',
+                        stack: error.stack
+                    }, null, 2)
+                }]
+            };
+        } finally {
+            await saveState();
+        }
+    }
+);
+
+// 2. Automated Optimization Tool
+server.registerTool(
+    'execute_optimization',
+    {
+        title: 'Execute Optimization',
+        description: 'Automatically optimize campaigns based on performance rules',
+        inputSchema: z.object({
+            mode: z.enum(['conservative', 'moderate', 'aggressive']).default('moderate'),
+            requireApproval: z.boolean().default(true)
+        })
+    },
+    async ({ mode, requireApproval }) => {
+        await loadState();
+        try {
+            const account = new AdAccount(accountId);
+            
+            // Define optimization rules based on mode
+            const rules = {
+                conservative: {
+                    pauseCtrThreshold: 0.3,
+                    pauseAfterSpend: 20,
+                    scaleRoasThreshold: 4,
+                    scaleBudgetIncrease: 1.2,
+                    maxDailyBudget: 100
+                },
+                moderate: {
+                    pauseCtrThreshold: 0.5,
+                    pauseAfterSpend: 15,
+                    scaleRoasThreshold: 3,
+                    scaleBudgetIncrease: 1.5,
+                    maxDailyBudget: 200
+                },
+                aggressive: {
+                    pauseCtrThreshold: 0.8,
+                    pauseAfterSpend: 10,
+                    scaleRoasThreshold: 2.5,
+                    scaleBudgetIncrease: 2.0,
+                    maxDailyBudget: 500
+                }
+            }[mode];
+            
+            const optimizations = {
+                paused: [],
+                scaled: [],
+                budgetAdjusted: [],
+                audienceExpanded: []
+            };
+            
+            // Get all active campaigns
+            const campaigns = await account.getCampaigns(
+                ['name', 'status', 'daily_budget', 'objective'],
+                {
+                    filtering: [{ field: 'effective_status', operator: 'IN', value: ['ACTIVE'] }],
+                    limit: 100
+                }
+            );
+            
+            for (const campaign of campaigns) {
+                try {
+                    const insights = await campaign.getInsights(
+                        ['spend', 'ctr', 'cpm', 'purchase_roas', 'frequency'],
+                        { date_preset: 'last_3d' }
+                    );
+                    
+                    const metrics = insights[0] || {};
+                    const ctr = parseFloat(metrics.ctr || 0);
+                    const spend = parseFloat(metrics.spend || 0);
+                    const frequency = parseFloat(metrics.frequency || 0);
+                    const currentBudget = parseFloat(campaign.daily_budget || 0);
+                    
+                    // Rule 1: Pause poor performers
+                    if (ctr < rules.pauseCtrThreshold && spend > rules.pauseAfterSpend) {
+                        optimizations.paused.push({
+                            campaignId: campaign.id,
+                            campaignName: campaign.name,
+                            reason: `CTR ${ctr.toFixed(2)}% below ${rules.pauseCtrThreshold}%`,
+                            metrics: { ctr, spend }
+                        });
+                        
+                        if (!requireApproval) {
+                            await campaign.update({ status: 'PAUSED' });
+                        }
+                    }
+                    
+                    // Rule 2: Scale winners (ROAS-based)
+                    else if (metrics.purchase_roas) {
+                        const roas = parseFloat(metrics.purchase_roas[0]?.value || 0);
+                        if (roas > rules.scaleRoasThreshold && currentBudget < rules.maxDailyBudget) {
+                            const newBudget = Math.min(
+                                currentBudget * rules.scaleBudgetIncrease,
+                                rules.maxDailyBudget
+                            );
+                            
+                            optimizations.scaled.push({
+                                campaignId: campaign.id,
+                                campaignName: campaign.name,
+                                reason: `ROAS ${roas.toFixed(2)}x exceeds ${rules.scaleRoasThreshold}x`,
+                                currentBudget: currentBudget,
+                                newBudget: newBudget,
+                                metrics: { roas, ctr }
+                            });
+                            
+                            if (!requireApproval) {
+                                await campaign.update({ daily_budget: newBudget });
+                            }
+                        }
+                    }
+                    
+                    // Rule 3: Scale winners (CTR-based)
+                    else if (ctr > 2 && currentBudget < rules.maxDailyBudget) {
+                        const newBudget = Math.min(
+                            currentBudget * 1.3,
+                            rules.maxDailyBudget
+                        );
+                        
+                        optimizations.scaled.push({
+                            campaignId: campaign.id,
+                            campaignName: campaign.name,
+                            reason: `High CTR ${ctr.toFixed(2)}%`,
+                            currentBudget: currentBudget,
+                            newBudget: newBudget,
+                            metrics: { ctr, spend }
+                        });
+                        
+                        if (!requireApproval) {
+                            await campaign.update({ daily_budget: newBudget });
+                        }
+                    }
+                    
+                    // Rule 4: Audience fatigue
+                    if (frequency > 5 && ctr < 1) {
+                        optimizations.audienceExpanded.push({
+                            campaignId: campaign.id,
+                            campaignName: campaign.name,
+                            reason: `High frequency ${frequency.toFixed(2)} with low CTR`,
+                            recommendation: 'Expand audience or refresh creative',
+                            metrics: { frequency, ctr }
+                        });
+                    }
+                    
+                } catch (error) {
+                    console.error(`Error optimizing campaign ${campaign.id}:`, error);
+                }
+            }
+            
+            // Calculate total impact
+            const totalSavings = optimizations.paused.reduce((sum, opt) => 
+                sum + campaignState[opt.campaignId]?.dailyBudget || 0, 0
+            );
+            
+            const totalInvestmentIncrease = optimizations.scaled.reduce((sum, opt) => 
+                sum + (opt.newBudget - opt.currentBudget), 0
+            );
+            
+            const response = {
+                mode: mode,
+                requireApproval: requireApproval,
+                executedAt: new Date().toISOString(),
+                summary: {
+                    campaignsAnalyzed: campaigns.length,
+                    campaignsPaused: optimizations.paused.length,
+                    campaignsScaled: optimizations.scaled.length,
+                    audienceFatigueDetected: optimizations.audienceExpanded.length,
+                    estimatedDailySavings: `$${totalSavings.toFixed(2)}`,
+                    additionalInvestment: `$${totalInvestmentIncrease.toFixed(2)}`
+                },
+                optimizations: optimizations,
+                rules: rules
+            };
+            
+            // Create approval request if needed
+            if (requireApproval && (optimizations.paused.length > 0 || optimizations.scaled.length > 0)) {
+                const approval = createApprovalRequest('EXECUTE_OPTIMIZATIONS', {
+                    optimizations: optimizations,
+                    impact: {
+                        savings: totalSavings,
+                        investment: totalInvestmentIncrease
+                    }
+                });
+                
+                response.approvalRequest = approval;
+                response.notification = {
+                    priority: NOTIFICATION_PRIORITY.URGENT,
+                    message: formatWhatsAppMessage({
+                        priority: NOTIFICATION_PRIORITY.URGENT,
+                        message: `Optimization ready for ${mode} mode:\n\n` +
+                                `• Pause ${optimizations.paused.length} campaigns (save $${totalSavings.toFixed(2)}/day)\n` +
+                                `• Scale ${optimizations.scaled.length} campaigns (invest +$${totalInvestmentIncrease.toFixed(2)}/day)\n` +
+                                `• ${optimizations.audienceExpanded.length} campaigns need audience refresh`,
+                        approvalId: approval.approvalId,
+                        expiresAt: approval.expiresAt
+                    }, 'approval_request')
+                };
+            }
+            
+            return {
+                content: [{
+                    type: 'text',
+                    text: JSON.stringify(response, null, 2)
+                }]
+            };
+            
+        } catch (error) {
+            return {
+                content: [{
+                    type: 'text',
+                    text: JSON.stringify({ 
+                        error: error.message,
+                        tool: 'execute_optimization',
+                        stack: error.stack
+                    }, null, 2)
+                }]
+            };
+        } finally {
+            await saveState();
+        }
+    }
+);
+
+// 3. Slack Integration Tool
+server.registerTool(
+    'format_slack_report',
+    {
+        title: 'Format Slack Report',
+        description: 'Format performance data for Slack with rich blocks',
+        inputSchema: z.object({
+            reportType: z.enum(['daily', 'weekly', 'alert', 'optimization']).default('daily'),
+            data: z.any()
+        })
+    },
+    async ({ reportType, data }) => {
+        try {
+            let blocks = [];
+            
+            switch (reportType) {
+                case 'daily':
+                    blocks = [
+                        {
+                            type: "header",
+                            text: {
+                                type: "plain_text",
+                                text: "📊 Daily Performance Report"
+                            }
+                        },
+                        {
+                            type: "section",
+                            fields: [
+                                {
+                                    type: "mrkdwn",
+                                    text: `*Total Spend:*\n$${data.spend || '0'}`
+                                },
+                                {
+                                    type: "mrkdwn",
+                                    text: `*ROAS:*\n${data.roas || 'N/A'}`
+                                },
+                                {
+                                    type: "mrkdwn",
+                                    text: `*CTR:*\n${data.ctr || '0'}%`
+                                },
+                                {
+                                    type: "mrkdwn",
+                                    text: `*CPM:*\n$${data.cpm || '0'}`
+                                }
+                            ]
+                        },
+                        {
+                            type: "divider"
+                        }
+                    ];
+                    
+                    // Add top performers
+                    if (data.topPerformers && data.topPerformers.length > 0) {
+                        blocks.push({
+                            type: "section",
+                            text: {
+                                type: "mrkdwn",
+                                text: "*🏆 Top Performers:*"
+                            }
+                        });
+                        
+                        data.topPerformers.slice(0, 3).forEach((ad, idx) => {
+                            blocks.push({
+                                type: "section",
+                                text: {
+                                    type: "mrkdwn",
+                                    text: `${idx + 1}. *${ad.name}*\n   CTR: ${ad.ctr} | ROAS: ${ad.roas} | Spend: $${ad.spend}`
+                                }
+                            });
+                        });
+                    }
+                    
+                    // Add actions taken
+                    if (data.actionsTaken && data.actionsTaken.length > 0) {
+                        blocks.push({
+                            type: "divider"
+                        });
+                        blocks.push({
+                            type: "section",
+                            text: {
+                                type: "mrkdwn",
+                                text: "*🔧 Actions Taken:*\n" + data.actionsTaken.map(action => `• ${action}`).join('\n')
+                            }
+                        });
+                    }
+                    
+                    // Add interactive buttons
+                    blocks.push({
+                        type: "actions",
+                        elements: [
+                            {
+                                type: "button",
+                                text: {
+                                    type: "plain_text",
+                                    text: "View Details"
+                                },
+                                value: "view_details",
+                                action_id: "view_details"
+                            },
+                            {
+                                type: "button",
+                                text: {
+                                    type: "plain_text",
+                                    text: "Run Optimization"
+                                },
+                                value: "run_optimization",
+                                action_id: "run_optimization",
+                                style: "primary"
+                            }
+                        ]
+                    });
+                    break;
+                    
+                case 'alert':
+                    const alertEmoji = {
+                        critical: '🚨',
+                        urgent: '⚠️',
+                        warning: '⚡',
+                        info: 'ℹ️',
+                        success: '🎉'
+                    };
+                    
+                    blocks = [
+                        {
+                            type: "section",
+                            text: {
+                                type: "mrkdwn",
+                                text: `${alertEmoji[data.priority] || '📢'} *${data.title}*\n\n${data.message}`
+                            }
+                        }
+                    ];
+                    
+                    if (data.metrics) {
+                        blocks.push({
+                            type: "section",
+                            fields: Object.entries(data.metrics).map(([key, value]) => ({
+                                type: "mrkdwn",
+                                text: `*${key}:*\n${value}`
+                            }))
+                        });
+                    }
+                    
+                    if (data.requiresAction) {
+                        blocks.push({
+                            type: "actions",
+                            elements: [
+                                {
+                                    type: "button",
+                                    text: {
+                                        type: "plain_text",
+                                        text: "Approve"
+                                    },
+                                    value: data.approvalId,
+                                    action_id: "approve_action",
+                                    style: "primary"
+                                },
+                                {
+                                    type: "button",
+                                    text: {
+                                        type: "plain_text",
+                                        text: "Reject"
+                                    },
+                                    value: data.approvalId,
+                                    action_id: "reject_action",
+                                    style: "danger"
+                                }
+                            ]
+                        });
+                    }
+                    break;
+            }
+            
+            return {
+                content: [{
+                    type: 'text',
+                    text: JSON.stringify({
+                        blocks: blocks,
+                        text: data.fallbackText || 'Facebook Ads Update'
+                    }, null, 2)
+                }]
+            };
+            
+        } catch (error) {
+            return {
+                content: [{
+                    type: 'text',
+                    text: JSON.stringify({ 
+                        error: error.message,
+                        tool: 'format_slack_report'
+                    }, null, 2)
+                }]
+            };
+        }
+    }
+);
+
 // ─── Transports ────────────────────────────────────────────────────────────
 const HTTP_PORT = process.env.PORT || 3001;   // Render/Heroku set PORT
 
@@ -1122,7 +1735,7 @@ app.post('/tool/:name', async (req, res) => {
     if (!tool) {
       return res
         .status(404)
-        .json({ error: `Tool “${toolName}” not found` });
+        .json({ error: `Tool "${toolName}" not found` });
     }
 
     // Execute the tool and return its result
